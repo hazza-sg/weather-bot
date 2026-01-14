@@ -54,6 +54,23 @@ class EventLoopState:
     cycle_duration_ms: float = 0
 
 
+@dataclass
+class TradingOpportunity:
+    """A trading opportunity identified by the system."""
+    market_id: str
+    token_id: str
+    market_question: str
+    side: str  # "YES" or "NO"
+    edge: float
+    forecast_probability: float
+    market_probability: float
+    model_agreement: float
+    confidence: str
+    recommended_size: float
+    location: Optional[str] = None
+    resolution_date: Optional[datetime] = None
+
+
 class TradingEventLoop:
     """
     Main event loop that orchestrates all trading operations.
@@ -79,6 +96,17 @@ class TradingEventLoop:
         self._market_scanner = None
         self._edge_calculator = None
         self._position_sizer = None
+        self._diversification_filter = None
+
+        # Execution layer components
+        self._order_monitor = None
+        self._position_tracker = None
+        self._price_feed = None
+
+        # Cached market data
+        self._active_markets: Dict[str, Dict[str, Any]] = {}
+        self._market_forecasts: Dict[str, Any] = {}
+        self._pending_opportunities: List[TradingOpportunity] = []
 
         # Tick interval (main loop frequency)
         self.tick_interval = 1.0  # seconds
@@ -136,17 +164,42 @@ class TradingEventLoop:
             self._trading_engine = trading_engine
 
             # Import and initialize strategy components
-            from strategy import EdgeCalculator, PositionSizer, MarketScanner
+            from strategy import EdgeCalculator, PositionSizer, MarketScanner, DiversificationFilter
             from risk import RiskManager
+            from execution import OrderMonitor, PositionTracker
+            from execution.price_feed import SimulatedPriceFeed
 
             self._edge_calculator = EdgeCalculator()
             self._position_sizer = PositionSizer(
                 initial_bankroll=self.settings.initial_bankroll
             )
             self._market_scanner = MarketScanner()
+            self._diversification_filter = DiversificationFilter(
+                initial_bankroll=self.settings.initial_bankroll
+            )
             self._risk_manager = RiskManager(
                 initial_bankroll=self.settings.initial_bankroll
             )
+
+            # Initialize execution components
+            self._order_monitor = OrderMonitor(
+                executor=trading_engine._executor,
+                poll_interval=5.0,
+            )
+            self._position_tracker = PositionTracker(
+                executor=trading_engine._executor,
+                price_update_interval=30.0,
+            )
+
+            # Use simulated price feed in test mode
+            if self.settings.test_mode:
+                self._price_feed = SimulatedPriceFeed(update_interval=10.0)
+            else:
+                from execution.price_feed import PriceFeed
+                self._price_feed = PriceFeed()
+
+            # Set up callbacks
+            self._setup_callbacks()
 
             # Register default tasks
             self._register_default_tasks()
@@ -156,7 +209,103 @@ class TradingEventLoop:
 
         except Exception as e:
             logger.error(f"Failed to initialize event loop: {e}")
+            logger.error(traceback.format_exc())
             return False
+
+    def _setup_callbacks(self) -> None:
+        """Set up callbacks for execution components."""
+        if self._order_monitor:
+            self._order_monitor.on_fill(self._handle_order_fill)
+            self._order_monitor.on_complete(self._handle_order_complete)
+
+        if self._position_tracker:
+            self._position_tracker.on_position_closed(self._handle_position_closed)
+            self._position_tracker.on_resolution(self._handle_market_resolution)
+
+        if self._price_feed:
+            self._price_feed.on_price(self._handle_price_update)
+
+    async def _handle_order_fill(self, order, fill_event) -> None:
+        """Handle order fill events."""
+        logger.info(f"Order {order.order_id} filled: {fill_event.size:.2f} @ {fill_event.price:.4f}")
+
+        await broadcast_message({
+            "type": "order_fill",
+            "order_id": order.order_id,
+            "market_id": order.market_id,
+            "side": order.side,
+            "fill_size": fill_event.size,
+            "fill_price": fill_event.price,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+
+    async def _handle_order_complete(self, order) -> None:
+        """Handle order completion."""
+        logger.info(f"Order {order.order_id} completed: {order.status.value}")
+
+        if order.status.value == "filled":
+            # Create position from filled order
+            from execution import TrackedPosition
+            import uuid
+
+            position = TrackedPosition(
+                position_id=str(uuid.uuid4())[:8],
+                market_id=order.market_id,
+                token_id=order.token_id,
+                market_question=f"Market {order.market_id}",
+                side="YES" if order.side == "BUY" else "NO",
+                quantity=order.filled_quantity,
+                size=order.filled_size,
+                entry_price=order.average_fill_price,
+                entry_time=datetime.utcnow(),
+                resolution_date=datetime.utcnow() + timedelta(days=7),
+                edge_at_entry=order.edge_at_entry,
+                forecast_probability=order.forecast_probability,
+            )
+
+            if self._position_tracker:
+                self._position_tracker.add_position(position)
+
+    async def _handle_position_closed(self, position) -> None:
+        """Handle position closure."""
+        logger.info(f"Position {position.position_id} closed: P&L = {position.realized_pnl:+.2f}")
+
+        # Update risk manager with realized P&L
+        if self._risk_manager:
+            self._risk_manager.update_pnl(position.realized_pnl)
+
+        await broadcast_message({
+            "type": "position_closed",
+            "position_id": position.position_id,
+            "realized_pnl": position.realized_pnl,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+
+    async def _handle_market_resolution(self, position, outcome) -> None:
+        """Handle market resolution."""
+        logger.info(f"Market resolved for {position.position_id}: {outcome}, P&L = {position.realized_pnl:+.2f}")
+
+        # Update risk manager with realized P&L
+        if self._risk_manager:
+            self._risk_manager.update_pnl(position.realized_pnl)
+
+        await broadcast_message({
+            "type": "market_resolution",
+            "position_id": position.position_id,
+            "outcome": outcome,
+            "realized_pnl": position.realized_pnl,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+
+    async def _handle_price_update(self, price_update) -> None:
+        """Handle price feed updates."""
+        # Update position tracker with new price
+        if self._position_tracker:
+            for position in self._position_tracker.get_open_positions():
+                if position.token_id == price_update.token_id:
+                    position.current_price = price_update.mid
+                    position.unrealized_pnl = position.calculate_unrealized_pnl()
+                    position.last_price_update = datetime.utcnow()
 
     def _register_default_tasks(self) -> None:
         """Register the default set of trading tasks."""
@@ -237,6 +386,16 @@ class TradingEventLoop:
 
         logger.info("Event loop starting...")
 
+        # Start execution components
+        if self._order_monitor:
+            await self._order_monitor.start_monitoring()
+
+        if self._position_tracker:
+            await self._position_tracker.start_price_updates()
+
+        if self._price_feed:
+            await self._price_feed.connect()
+
         try:
             await self._run_loop()
         except asyncio.CancelledError:
@@ -245,6 +404,16 @@ class TradingEventLoop:
             logger.error(f"Event loop error: {e}")
             logger.error(traceback.format_exc())
         finally:
+            # Stop execution components
+            if self._order_monitor:
+                await self._order_monitor.stop_monitoring()
+
+            if self._position_tracker:
+                await self._position_tracker.stop_price_updates()
+
+            if self._price_feed:
+                await self._price_feed.disconnect()
+
             self.state.is_running = False
             logger.info("Event loop stopped")
 
@@ -355,34 +524,42 @@ class TradingEventLoop:
                     "message": f"Trading halted: {reason}",
                     "timestamp": datetime.utcnow().isoformat(),
                 })
+        else:
+            # Clear halt if conditions allow
+            if self._trading_engine.is_halted:
+                self._trading_engine.is_halted = False
+                self._trading_engine.halt_reason = None
+                logger.info("Trading halt cleared - conditions normal")
 
     async def _task_price_update(self) -> None:
         """Update position prices from market."""
-        if not self._trading_engine:
+        if not self._position_tracker:
             return
 
-        # Get current market prices for open positions
-        positions = await self._trading_engine.get_open_positions()
+        # Trigger price update for all positions
+        await self._position_tracker._update_all_prices()
 
-        for position in positions:
-            # In real implementation, fetch current price from CLOB
-            # For now, simulate small price movement
-            pass
+        positions = self._position_tracker.get_open_positions()
 
         await broadcast_message({
             "type": "price_update",
             "timestamp": datetime.utcnow().isoformat(),
             "positions_updated": len(positions),
+            "total_unrealized_pnl": self._position_tracker.get_total_unrealized_pnl(),
         })
 
     async def _task_order_monitor(self) -> None:
         """Monitor pending orders for fills."""
-        if not self._trading_engine or not self._trading_engine._executor:
+        if not self._order_monitor:
             return
 
-        # Check for filled orders
-        # In real implementation, would query CLOB for order status
-        pass
+        # Check order status
+        await self._order_monitor._check_orders()
+
+        open_orders = self._order_monitor.get_open_orders()
+
+        if open_orders:
+            logger.debug(f"Monitoring {len(open_orders)} open orders")
 
     async def _task_market_scan(self) -> None:
         """Scan for new weather markets."""
@@ -405,6 +582,12 @@ class TradingEventLoop:
                 if parsed and parsed.market_type != "unknown":
                     parsed_markets.append(parsed)
 
+                    # Cache market data
+                    self._active_markets[market.get("id", "")] = {
+                        "raw": market,
+                        "parsed": parsed,
+                    }
+
             logger.info(f"Market scan found {len(parsed_markets)} tradeable markets")
 
             await broadcast_message({
@@ -421,13 +604,39 @@ class TradingEventLoop:
         if not self._trading_engine or not self._trading_engine._weather_client:
             return
 
-        # Get markets that need forecast updates
-        # In real implementation, would iterate through markets and fetch forecasts
+        updated_count = 0
+
+        for market_id, market_data in self._active_markets.items():
+            parsed = market_data.get("parsed")
+            if not parsed:
+                continue
+
+            # Only fetch forecasts for markets with valid coordinates
+            if not (parsed.latitude and parsed.longitude):
+                continue
+
+            try:
+                forecast = await self._trading_engine._weather_client.get_ensemble_forecast(
+                    latitude=parsed.latitude,
+                    longitude=parsed.longitude,
+                    target_date=parsed.resolution_date,
+                )
+
+                if forecast:
+                    self._market_forecasts[market_id] = forecast
+                    updated_count += 1
+
+            except Exception as e:
+                logger.error(f"Failed to fetch forecast for {market_id}: {e}")
+
         self._trading_engine._last_forecast_update = datetime.utcnow()
+
+        logger.info(f"Updated forecasts for {updated_count} markets")
 
         await broadcast_message({
             "type": "forecast_update",
             "timestamp": datetime.utcnow().isoformat(),
+            "forecasts_updated": updated_count,
         })
 
     async def _task_trading_cycle(self) -> None:
@@ -444,17 +653,134 @@ class TradingEventLoop:
         if self._trading_engine.status != "active":
             return
 
-        # In real implementation:
-        # 1. Get markets with forecasts
-        # 2. Calculate edge for each
-        # 3. Filter by diversification rules
-        # 4. Size positions with Kelly
-        # 5. Execute trades
+        # Clear previous opportunities
+        self._pending_opportunities.clear()
+        opportunities_found = 0
+        trades_executed = 0
+
+        # Step 1: Calculate edge for each market with forecast
+        for market_id, forecast in self._market_forecasts.items():
+            market_data = self._active_markets.get(market_id, {})
+            raw_market = market_data.get("raw", {})
+            parsed = market_data.get("parsed")
+
+            if not parsed:
+                continue
+
+            # Get current market price
+            market_price = raw_market.get("yes_price", raw_market.get("price", 0.5))
+
+            # Calculate edge
+            try:
+                edge_calc = self._edge_calculator.calculate_from_forecast_data(
+                    forecast_data=forecast,
+                    threshold=parsed.threshold or 0,
+                    comparison=parsed.comparison or ">=",
+                    market_price=market_price,
+                    unit=parsed.unit or "fahrenheit",
+                )
+
+                if edge_calc.is_tradeable():
+                    opportunity = TradingOpportunity(
+                        market_id=market_id,
+                        token_id=raw_market.get("token_id", market_id),
+                        market_question=raw_market.get("question", ""),
+                        side=edge_calc.recommended_side,
+                        edge=edge_calc.edge,
+                        forecast_probability=edge_calc.forecast_probability,
+                        market_probability=edge_calc.market_probability,
+                        model_agreement=edge_calc.model_agreement,
+                        confidence=edge_calc.confidence_level.value,
+                        recommended_size=0,  # Will be calculated
+                        location=parsed.location,
+                        resolution_date=parsed.resolution_date,
+                    )
+                    self._pending_opportunities.append(opportunity)
+                    opportunities_found += 1
+
+            except Exception as e:
+                logger.error(f"Edge calculation failed for {market_id}: {e}")
+
+        # Step 2: Size positions and check diversification
+        for opportunity in self._pending_opportunities:
+            # Calculate Kelly-based position size
+            effective_price = opportunity.market_probability
+            if opportunity.side == "NO":
+                effective_price = 1 - effective_price
+
+            position_size = self._position_sizer.calculate_position_size(
+                bankroll=self._trading_engine.current_bankroll,
+                forecast_prob=opportunity.forecast_probability,
+                market_price=effective_price,
+                side=opportunity.side,
+                model_agreement=opportunity.model_agreement,
+            )
+
+            if not position_size.is_valid:
+                continue
+
+            # Check diversification limits
+            existing_positions = []
+            if self._position_tracker:
+                existing_positions = [
+                    {
+                        "location": p.location,
+                        "resolution_date": p.resolution_date,
+                        "size": p.size,
+                    }
+                    for p in self._position_tracker.get_open_positions()
+                ]
+
+            trade_info = {
+                "location": opportunity.location,
+                "resolution_date": opportunity.resolution_date,
+                "size": position_size.final_size,
+            }
+
+            div_result = self._diversification_filter.check_diversification_limits(
+                trade=trade_info,
+                portfolio=existing_positions,
+                bankroll=self._trading_engine.current_bankroll,
+            )
+
+            if not div_result.is_allowed:
+                logger.debug(f"Trade blocked by diversification: {div_result.rejection_reason}")
+                continue
+
+            # Adjust size if needed
+            final_size = min(
+                position_size.final_size,
+                div_result.max_allowed_size or position_size.final_size
+            )
+
+            opportunity.recommended_size = final_size
+
+        # Step 3: Execute trades for valid opportunities
+        for opportunity in self._pending_opportunities:
+            if opportunity.recommended_size <= 0:
+                continue
+
+            # Execute trade
+            result = await self._trading_engine.execute_trade(
+                market_id=opportunity.market_id,
+                side=opportunity.side,
+                size=opportunity.recommended_size,
+                price=opportunity.market_probability,
+            )
+
+            if result.get("success"):
+                trades_executed += 1
+                logger.info(
+                    f"Trade executed: {opportunity.side} ${opportunity.recommended_size:.2f} "
+                    f"on {opportunity.market_id} (edge: {opportunity.edge:.1%})"
+                )
 
         await broadcast_message({
             "type": "trading_cycle",
             "timestamp": datetime.utcnow().isoformat(),
             "status": "completed",
+            "opportunities_found": opportunities_found,
+            "trades_executed": trades_executed,
         })
 
     async def _task_status_broadcast(self) -> None:
@@ -464,6 +790,16 @@ class TradingEventLoop:
 
         status = self._trading_engine.get_status()
 
+        # Add execution layer stats
+        order_stats = {}
+        position_stats = {}
+
+        if self._order_monitor:
+            order_stats = self._order_monitor.get_statistics()
+
+        if self._position_tracker:
+            position_stats = self._position_tracker.get_statistics()
+
         await broadcast_message({
             "type": "status",
             "data": {
@@ -471,7 +807,10 @@ class TradingEventLoop:
                 "uptime": status.uptime_seconds,
                 "trading_enabled": status.trading_enabled,
                 "open_positions": status.open_positions_count,
+                "pending_orders": order_stats.get("open_orders", 0),
                 "api_connected": status.api_connected,
+                "unrealized_pnl": position_stats.get("unrealized_pnl", 0),
+                "realized_pnl": position_stats.get("realized_pnl", 0),
             },
             "timestamp": datetime.utcnow().isoformat(),
         })
@@ -483,9 +822,15 @@ class TradingEventLoop:
 
         portfolio = await self._trading_engine.get_portfolio_summary()
 
+        # Add position tracker stats
+        position_stats = {}
+        if self._position_tracker:
+            position_stats = self._position_tracker.get_statistics()
+
         logger.info(
             f"Metrics | Bankroll: ${portfolio.bankroll:.2f} | "
             f"Daily P&L: ${portfolio.daily_pnl:+.2f} | "
+            f"Unrealized: ${position_stats.get('unrealized_pnl', 0):+.2f} | "
             f"Win Rate: {portfolio.win_rate:.1%} | "
             f"Trades: {portfolio.total_trades}"
         )
@@ -506,6 +851,8 @@ class TradingEventLoop:
             "tasks_executed": self.state.tasks_executed,
             "errors_encountered": self.state.errors_encountered,
             "cycle_duration_ms": self.state.cycle_duration_ms,
+            "active_markets": len(self._active_markets),
+            "pending_opportunities": len(self._pending_opportunities),
         }
 
     def get_task_status(self) -> Dict[str, Dict[str, Any]]:
@@ -525,6 +872,23 @@ class TradingEventLoop:
             }
 
         return result
+
+    def get_opportunities(self) -> List[Dict[str, Any]]:
+        """Get current trading opportunities."""
+        return [
+            {
+                "market_id": o.market_id,
+                "market_question": o.market_question,
+                "side": o.side,
+                "edge": o.edge,
+                "forecast_probability": o.forecast_probability,
+                "market_probability": o.market_probability,
+                "confidence": o.confidence,
+                "recommended_size": o.recommended_size,
+                "location": o.location,
+            }
+            for o in self._pending_opportunities
+        ]
 
 
 # Global event loop instance
